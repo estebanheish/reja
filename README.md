@@ -1,1 +1,3 @@
-- scroll bounds
+- clear prompt
+- autoscroll
+- borrar una palabra con esc + backspace

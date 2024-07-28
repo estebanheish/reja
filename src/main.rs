@@ -1,8 +1,10 @@
 mod config;
 mod markdown;
 mod ollama;
+mod prompt;
 use markdown::Markdown;
 use ollama::{chat, Converation, Message};
+use prompt::Prompt;
 use ratatui::{
     backend::CrosstermBackend,
     crossterm::{
@@ -10,17 +12,16 @@ use ratatui::{
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
         ExecutableCommand,
     },
-    layout::{Constraint, Direction, Layout},
-    style::Style,
-    widgets::{Block, Clear, Padding},
     Frame, Terminal,
 };
 use std::{
     io::{self, stdout, Result, Stdout},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
+        Arc,
+    },
 };
 use tokio::sync::RwLock;
-use tui_textarea::TextArea;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -29,27 +30,22 @@ struct Reja<'a> {
     last_rendered: String,
     exit: bool,
     rerender: bool,
-    prompt: TextArea<'a>,
+    prompt: Prompt<'a>,
     cursor: usize,
-    scroll: i32,
+    scroll: Arc<AtomicUsize>,
     send: bool,
     messages_len: usize,
     receiving: Arc<AtomicBool>,
     sysmsgs_len: usize,
-}
-
-fn default_prompt<'a>() -> TextArea<'a> {
-    let mut ta = TextArea::default();
-    ta.set_cursor_line_style(Style::default());
-    ta.set_cursor_style(Style::default().bg(ratatui::style::Color::Cyan));
-    ta.set_block(Block::default().padding(Padding::new(3, 3, 1, 0)));
-    ta
+    markdown: Markdown,
 }
 
 impl Reja<'_> {
     fn new(conv: Converation) -> Self {
+        let scroll_atomic = Arc::new(AtomicUsize::new(0));
+        let height = Arc::new(AtomicUsize::new(0));
         Self {
-            prompt: default_prompt(),
+            prompt: Prompt::new(),
             last_rendered: "".to_string(),
             sysmsgs_len: conv.messages.len(),
             cursor: conv.messages.len(),
@@ -58,8 +54,9 @@ impl Reja<'_> {
             rerender: false,
             exit: false,
             send: false,
-            scroll: 0,
+            scroll: scroll_atomic.clone(),
             messages_len: 0,
+            markdown: Markdown::new("".to_string(), scroll_atomic, height),
         }
     }
 
@@ -86,39 +83,39 @@ impl Reja<'_> {
             }
             chat(
                 self.conversation.clone(),
-                self.prompt.clone().into_lines().remove(0),
+                self.prompt.0.clone().into_lines().remove(0),
                 self.receiving.clone(),
             )
             .await;
             self.messages_len += 2;
-            self.prompt = default_prompt();
+            self.prompt = Prompt::new();
             self.send = false;
         }
     }
 
     fn render(&mut self, frame: &mut Frame, message: Option<Message>) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(90), Constraint::Percentage(10)])
+        let area = frame.size();
+        let h = self.markdown.height.load(SeqCst) as u16 + 1;
+        let k = if h > area.height - 3 { h - 3 } else { h };
+        let layout = ratatui::layout::Layout::default()
+            .direction(ratatui::layout::Direction::Vertical)
+            .constraints([
+                ratatui::layout::Constraint::Max(k),
+                ratatui::layout::Constraint::Min(3),
+            ])
             .split(frame.size());
         if let Some(message) = message {
             if message.content != self.last_rendered || self.rerender {
-                frame.render_widget(
-                    Markdown {
-                        content: message.content.clone(),
-                        scroll: self.scroll,
-                    },
-                    frame.size(),
-                );
+                self.markdown.content.clone_from(&message.content);
+                frame.render_widget(&self.markdown, frame.size());
                 self.rerender = false;
                 self.last_rendered.clone_from(&message.content);
             }
-            if self.prompt.cursor() != (0, 0) {
-                frame.render_widget(Clear, chunks[1]);
-                frame.render_widget(self.prompt.widget(), chunks[1]);
+            if !self.prompt.0.is_empty() {
+                frame.render_widget(self.prompt.0.widget(), layout[1]);
             }
         } else {
-            frame.render_widget(self.prompt.widget(), frame.size());
+            frame.render_widget(self.prompt.0.widget(), frame.size());
         }
     }
 
@@ -137,27 +134,28 @@ impl Reja<'_> {
     }
 
     fn handle_key_event(&mut self, key_event: KeyEvent) {
+        let receiving = self.receiving.load(SeqCst);
         match key_event.code {
             KeyCode::Esc => self.exit = true,
-            KeyCode::Enter => self.send = true,
+            KeyCode::Enter if !receiving => self.send = true,
             KeyCode::Char(c) if c == 'q' && key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.exit = true
             }
             KeyCode::Char('s') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.receiving
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                self.receiving.store(false, SeqCst);
             }
             KeyCode::Char('u') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.prompt = default_prompt();
+                if self.prompt.0.is_empty() {
+                    self.scroll_up(5);
+                } else {
+                    self.prompt = Prompt::new();
+                }
             }
-            KeyCode::Up => {
-                self.scroll -= 1;
-                self.rerender = true;
+            KeyCode::Char('d') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_down(5)
             }
-            KeyCode::Down => {
-                self.scroll += 1;
-                self.rerender = true;
-            }
+            KeyCode::Up => self.scroll_up(1),
+            KeyCode::Down => self.scroll_down(1),
             KeyCode::Left => {
                 if self.cursor > self.sysmsgs_len {
                     self.cursor -= 2;
@@ -171,23 +169,35 @@ impl Reja<'_> {
                 }
             }
             _ => {
-                self.prompt.input(key_event);
+                if !receiving {
+                    self.prompt.0.input(key_event);
+                }
             }
         }
     }
 
     fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
         match mouse_event.kind {
-            event::MouseEventKind::ScrollDown => {
-                self.scroll += 1;
-                self.rerender = true;
-            }
-            event::MouseEventKind::ScrollUp => {
-                self.scroll -= 1;
-                self.rerender = true;
-            }
+            event::MouseEventKind::ScrollDown => self.scroll_down(1),
+            event::MouseEventKind::ScrollUp => self.scroll_up(1),
             _ => {}
         }
+    }
+
+    fn scroll_up(&mut self, offset: usize) {
+        let k = self.scroll.load(SeqCst);
+        if k > offset {
+            self.scroll.store(k - offset, SeqCst);
+        } else {
+            self.scroll.store(0, SeqCst);
+        }
+        self.rerender = true;
+    }
+
+    fn scroll_down(&mut self, offset: usize) {
+        let k = self.scroll.load(SeqCst);
+        self.scroll.store(k + offset, SeqCst);
+        self.rerender = true;
     }
 }
 
