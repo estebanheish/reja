@@ -1,3 +1,2 @@
-- clear prompt
 - autoscroll
-- borrar una palabra con esc + backspace
+- export conversation

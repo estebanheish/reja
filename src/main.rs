@@ -124,7 +124,11 @@ impl Reja<'_> {
             match event::read()? {
                 event::Event::Resize(_, _) => self.rerender = true,
                 event::Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
-                    self.handle_key_event(key_event);
+                    if key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                        self.handle_key_event_ctrl(key_event);
+                    } else {
+                        self.handle_key_event(key_event);
+                    }
                 }
                 event::Event::Mouse(mouse_event) => self.handle_mouse_event(mouse_event),
                 _ => {}
@@ -136,24 +140,8 @@ impl Reja<'_> {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         let receiving = self.receiving.load(SeqCst);
         match key_event.code {
-            KeyCode::Esc => self.exit = true,
+            KeyCode::Esc => self.prompt = Prompt::new(),
             KeyCode::Enter if !receiving => self.send = true,
-            KeyCode::Char(c) if c == 'q' && key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.exit = true
-            }
-            KeyCode::Char('s') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.receiving.store(false, SeqCst);
-            }
-            KeyCode::Char('u') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.prompt.0.is_empty() {
-                    self.scroll_up(5);
-                } else {
-                    self.prompt = Prompt::new();
-                }
-            }
-            KeyCode::Char('d') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.scroll_down(5)
-            }
             KeyCode::Up => self.scroll_up(1),
             KeyCode::Down => self.scroll_down(1),
             KeyCode::Left => {
@@ -176,6 +164,24 @@ impl Reja<'_> {
         }
     }
 
+    fn handle_key_event_ctrl(&mut self, key_event: KeyEvent) {
+        match key_event.code {
+            KeyCode::Char('q') => self.exit = true,
+            KeyCode::Char('s') => self.receiving.store(false, SeqCst),
+            KeyCode::Char('d') => self.scroll_down(5),
+            KeyCode::Char('w') => {
+                self.prompt.0.delete_word();
+            }
+            KeyCode::Char('u') => {
+                if self.prompt.0.is_empty() {
+                    self.scroll_up(5);
+                } else {
+                    self.prompt = Prompt::new();
+                }
+            }
+            _ => {}
+        }
+    }
     fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
         match mouse_event.kind {
             event::MouseEventKind::ScrollDown => self.scroll_down(1),
